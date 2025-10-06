@@ -7,14 +7,14 @@ import random
 import time
 import re
 from unicodedata import normalize
-from typing import Tuple 
+from typing import Tuple, Dict 
 from enum import Enum
+import hashlib # ハッシュ値計算のために追加
 
 # pixivpy3は外部ライブラリなので、別途インストールが必要です
 try:
     from pixivpy3 import AppPixivAPI
 except ImportError:
-    # GUI側でエラーメッセージを出すため、ここではloggingのみ
     logging.critical("エラー: pixivpy3 ライブラリが見つかりません。")
     sys.exit(1)
 
@@ -41,13 +41,13 @@ class ContentType(Enum):
 class RankPresetManager:
     """ RankingModeに基づいて、推奨される最小閲覧数と最小ブックマーク数を管理するクラス。 """
     PRESETS = {
-        RankingMode.DAILY.name:        ("1000", "1000"),
-        RankingMode.DAILY_MALE.name:   ("1000", "1000"),
+        RankingMode.DAILY.name:     ("1000", "1000"),
+        RankingMode.DAILY_MALE.name:    ("1000", "1000"),
         RankingMode.DAILY_FEMALE.name: ("1000", "1000"),
-        RankingMode.DAILY_AI.name:     ("1000", "1000"),
-        RankingMode.WEEKLY.name:       ("5000", "2000"),
+        RankingMode.DAILY_AI.name:      ("1000", "1000"),
+        RankingMode.WEEKLY.name:        ("5000", "2000"),
         RankingMode.WEEKLY_ORIGINAL.name: ("1000", "1000"),
-        RankingMode.MONTHLY.name:      ("10000", "5000"), 
+        RankingMode.MONTHLY.name:       ("10000", "5000"), 
     }
     
     @staticmethod
@@ -76,6 +76,8 @@ class PixivRankAnalyzer:
         self.api = None
         
         self.download_dir = self._generate_download_dir_name()
+        # 既存ファイルのハッシュ値を格納する辞書 {ハッシュ値: ファイル名}
+        self.existing_hashes: Dict[str, str] = {} 
         
     # --- ユーティリティメソッド ---
     @staticmethod
@@ -87,21 +89,22 @@ class PixivRankAnalyzer:
         s = normalize('NFKC', s)
         return s[:max_length]
 
+    # ... (他_get_mode_name_japanese, _get_content_name_japanese, _to_k_unit, _generate_download_dir_name, _rand_sleep は変更なし) ...
     @staticmethod
     def _get_mode_name_japanese(mode):
         return {
-             RankingMode.DAILY: '日間', RankingMode.WEEKLY: '週間', 
-             RankingMode.MONTHLY: '月間', 
-             RankingMode.DAILY_MALE: '男性人気', RankingMode.DAILY_FEMALE: '女性人気',
-             RankingMode.DAILY_AI: '日間AI',
-             RankingMode.WEEKLY_ORIGINAL: '週間オリジナル'
+              RankingMode.DAILY: '日間', RankingMode.WEEKLY: '週間', 
+              RankingMode.MONTHLY: '月間', 
+              RankingMode.DAILY_MALE: '男性人気', RankingMode.DAILY_FEMALE: '女性人気',
+              RankingMode.DAILY_AI: '日間AI',
+              RankingMode.WEEKLY_ORIGINAL: '週間オリジナル'
         }.get(mode, mode.name)
 
     @staticmethod
     def _get_content_name_japanese(content):
         return {
-             ContentType.ILLUST: 'イラスト', ContentType.MANGA: 'マンガ', 
-             ContentType.ALL: 'すべて'
+              ContentType.ILLUST: 'イラスト', ContentType.MANGA: 'マンガ', 
+              ContentType.ALL: 'すべて'
         }.get(content, content.name)
 
     @staticmethod
@@ -127,6 +130,40 @@ class PixivRankAnalyzer:
         delay = random.uniform(1, 3)
         time.sleep(delay)
         logging.debug(f"Sleep for {delay:.2f} seconds.")
+
+    @staticmethod
+    def _calculate_file_hash(filepath, block_size=65536):
+        """ファイルのSHA256ハッシュ値を計算する"""
+        hasher = hashlib.sha256()
+        try:
+            with open(filepath, 'rb') as f:
+                buf = f.read(block_size)
+                while len(buf) > 0:
+                    hasher.update(buf)
+                    buf = f.read(block_size)
+            return hasher.hexdigest()
+        except Exception as e:
+            logging.warning(f"ハッシュ値計算エラー: {filepath}: {e}")
+            return None
+
+    def _load_existing_hashes(self):
+        """ダウンロードディレクトリ内の既存ファイルのハッシュ値を計算し、self.existing_hashesに格納する"""
+        self.existing_hashes = {}
+        if not os.path.isdir(self.download_dir):
+            return
+            
+        print("既存ファイルのハッシュ値をチェック中...")
+        logging.info(f"既存のダウンロードディレクトリ '{self.download_dir}' 内のファイルをチェックしています。")
+        
+        for filename in os.listdir(self.download_dir):
+            filepath = os.path.join(self.download_dir, filename)
+            if os.path.isfile(filepath):
+                file_hash = self._calculate_file_hash(filepath)
+                if file_hash:
+                    self.existing_hashes[file_hash] = filename
+        
+        print(f"✅ 既存ファイル {len(self.existing_hashes)} 件のハッシュ値チェック完了。")
+        logging.info(f"ロードされた既存ハッシュ数: {len(self.existing_hashes)}")
 
     # --- 認証機能 ---
     def authenticate(self):
@@ -199,15 +236,18 @@ class PixivRankAnalyzer:
         if not sorted_list or not self.enable_download:
             return
 
+        # ダウンロードディレクトリが存在しない場合は作成
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir)
             logging.info(f"📁 ダウンロードディレクトリ '{self.download_dir}' を作成しました。")
+        
+        # **【追加されたロジック】既存ファイルのハッシュ値をロード**
+        self._load_existing_hashes()
 
         # NOTE: print()はGUI側でログにリダイレクトされる
         print(f"\n--- ブックマーク率トップ {self.download_count} 件の画像をダウンロード中 (保存先: {self.download_dir})... ---")
         
         for i, item in enumerate(sorted_list[:self.download_count]):
-            # ... (中略: ダウンロードロジックは変更なし) ...
             illust_id = item['id']
             
             rate_str = f"率{item['rate']:.2f}"
@@ -244,31 +284,69 @@ class PixivRankAnalyzer:
                 page_num = idx + 1
                 page_suffix = f"_p{page_num}" if len(image_urls) > 1 else ""
                 final_file_name = f"{prefix}{page_suffix}{ext}"
-                
+                temp_filepath = os.path.join(self.download_dir, final_file_name)
+
                 is_page_downloaded = False
-                for attempt in range(3):
-                    try:
-                        if self.api.download(url, path=self.download_dir, name=final_file_name):
-                            success_count += 1
-                            is_page_downloaded = True
-                            self._rand_sleep()
-                            break 
-                        else:
-                             is_page_downloaded = True 
-                             break
-                    except Exception as e:
-                        logging.warning(f"  [Attempt {attempt+1}] Download {final_file_name} failed: {e}")
-                        self._rand_sleep()
+                is_duplicate = False
                 
-                if not is_page_downloaded:
+                # ダウンロード前にファイル名が重複しているかチェック (※これはハッシュチェックとは別)
+                if os.path.exists(temp_filepath):
+                    temp_hash = self._calculate_file_hash(temp_filepath)
+                    if temp_hash in self.existing_hashes:
+                         print(f"\r♻️ スキップ (ファイル名/ハッシュ重複): {final_file_name}")
+                         success_count += 1
+                         is_page_downloaded = True
+                         is_duplicate = True
+                         continue
+
+                if not is_duplicate:
+                    for attempt in range(3):
+                        try:
+                            # 既存のファイル名を上書きしてダウンロードを実行
+                            if self.api.download(url, path=self.download_dir, name=final_file_name):
+                                
+                                # **【追加されたロジック】ダウンロード後のハッシュチェック**
+                                downloaded_hash = self._calculate_file_hash(temp_filepath)
+                                
+                                if downloaded_hash and downloaded_hash in self.existing_hashes:
+                                    # 重複を発見したらファイルを削除
+                                    os.remove(temp_filepath)
+                                    existing_file = self.existing_hashes[downloaded_hash]
+                                    print(f"\r♻️ スキップ (内容重複): {final_file_name} は {existing_file} と同一のため削除しました。")
+                                    is_duplicate = True
+                                else:
+                                    # 新規ファイルとしてハッシュを登録
+                                    if downloaded_hash:
+                                        self.existing_hashes[downloaded_hash] = final_file_name
+                                    
+                                    success_count += 1
+                                    is_page_downloaded = True
+                                    self._rand_sleep()
+                                    break 
+                                    
+                            else:
+                                is_page_downloaded = True 
+                                break
+                                
+                        except Exception as e:
+                            logging.warning(f"  [Attempt {attempt+1}] Download {final_file_name} failed: {e}")
+                            self._rand_sleep()
+                        
+                        if is_duplicate: # 重複でスキップした場合は次のページへ
+                            break
+
+                if not is_page_downloaded and not is_duplicate:
                     logging.error(f"❌ 警告: ID {illust_id} のページ{idx+1} ({final_file_name}) は3回の試行でダウンロードできませんでした。")
 
             if success_count == len(image_urls) and len(image_urls) > 0:
                 print(f"\r✅ ダウンロード完了: {prefix} ({success_count}枚)")
             elif len(image_urls) == 0:
                 print(f"\r⚠️ ID {illust_id} はダウンロード可能な画像が見つかりませんでした。")
+            elif success_count > 0:
+                 # 一部が重複スキップまたはダウンロード失敗した場合
+                print(f"\r⚠️ ダウンロード完了: {prefix} ({success_count}枚成功 / {len(image_urls) - success_count}枚スキップ/失敗)")
             else:
-                print(f"\r⚠️ ダウンロード一部/全体失敗: {prefix} ({success_count}/{len(image_urls)}枚成功)")
+                print(f"\r❌ ダウンロード失敗/全て重複スキップ: {prefix}")
 
 
 # --- ロギング設定 ---
